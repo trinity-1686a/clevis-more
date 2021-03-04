@@ -1,0 +1,9 @@
+#!/bin/bash
+
+res=$(tr -d '.' | jose b64 dec -i-)
+chain=$(jose fmt -j- -g clevis -g chain -Su- <<< "$res")
+layer=$(clevis decrypt <<< "$chain")
+while [ $(echo "$layer" | dd bs=1 count=1 2>/dev/null) == "#" ]; do
+    layer=$(tail -c +2 <<< "$layer" | clevis decrypt)
+done
+tail -c +2 <<< "$layer"

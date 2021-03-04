@@ -1,0 +1,59 @@
+#!/bin/bash
+
+SUMMARY="Encrypts by chaining multiple pins
+Informations from inner pin is not shown until outer ones are decrypted"
+
+if [ "$1" == "--summary" ]; then
+    echo "$SUMMARY"
+    exit 0
+fi
+
+if [ -t 0 ]; then
+    exec >&2
+    echo
+    echo "Usage: clevis encrypt chain CONFIG < PLAINTEXT > JWE"
+    echo
+    echo "$SUMMARY"
+    echo
+    echo "This command takes a list of object containing the following configuration properties:"
+    echo
+    echo "  pin: <string>   The pin used at this layer"
+    echo
+    echo "  config: <object>   The configuration for the given pin"
+    echo
+    exit 2
+fi
+
+if ! cfg="$(jose fmt -j "$1" -Ao- 2>/dev/null)"; then
+    echo "Configuration is malformed!" >&2
+    exit 1
+fi
+
+pins=$(($(jose fmt -j- -Alo- <<< "$cfg") - 1))
+pin_list=()
+for i in $(seq $pin_count -1 0); do
+    pin=$(jose fmt -j- -Ag $i -o- <<<"$cfg")
+    pin_name=$(jose fmt -j- -Og pin -u- <<<"$pin")
+    pin_cfg=$(jose fmt -j- -Og config -o- <<<"$pin")
+
+    pin_list+=($pin_name)
+    pin_list+=($pin_cfg)
+done
+
+run_pipeline() {
+    if [[ $# -gt 0 ]]; then
+        local name=$1
+	shift
+        local cfg=$1
+	shift
+	(echo -n '#'; clevis encrypt "$name" "$cfg") | run_pipeline "$@"
+    else
+	dd bs=1 count=1 of=/dev/null 2> /dev/null
+        cat
+    fi
+}
+
+res=$( (echo -n '$'; cat) | run_pipeline "${pin_list[@]}")
+
+jose fmt -j '{"clevis": {"pin": "chain"}}' -g clevis -q "$res" -s chain -UUYu- | tr -d '\n'
+echo .
