@@ -1,0 +1,218 @@
+#!/bin/bash -e
+# vim: set tabstop=8 shiftwidth=4 softtabstop=4 expandtab smarttab colorcolumn=80:
+#
+# Copyright (c) 2017 Red Hat, Inc.
+# Author: Javier Martinez Canillas <javierm@redhat.com>
+#
+# This program is free software: you can redistribute it and/or modify
+# it under the terms of the GNU General Public License as published by
+# the Free Software Foundation, either version 3 of the License, or
+# (at your option) any later version.
+#
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU General Public License for more details.
+#
+# You should have received a copy of the GNU General Public License
+# along with this program.  If not, see <http://www.gnu.org/licenses/>.
+#
+
+# First try to use the new version of the PIN implementation
+if command -v clevis-pin-tpm2 >/dev/null;
+then
+    exec clevis-pin-tpm2 encrypt "$@"
+fi
+
+SUMMARY="Encrypts using a TPM2.0 chip binding policy based on counters and timers"
+# Algorithm type must be keyedhash for object with user provided sensitive data.
+alg_create_key="keyedhash"
+# Attributes for the created TPM2 object with the JWK as sensitive data.
+obj_attr="fixedtpm|fixedparent|noda|adminwithpolicy"
+#obj_attr="fixedtpm|fixedparent|noda|adminwithpolicy|userwithauth"
+
+function on_exit() {
+    if [ ! -d "$TMP" ] || ! rm -rf "$TMP"; then
+        echo "Delete temporary files failed!" >&2
+        echo "You need to clean up: $TMP" >&2
+        exit 1
+    fi
+}
+
+if [ "$1" == "--summary" ]; then
+    echo "$SUMMARY"
+    exit 0
+fi
+
+if [ -t 0 ]; then
+    exec >&2
+    echo
+    echo "Usage: clevis encrypt tpm2 CONFIG < PLAINTEXT > JWE"
+    echo
+    echo "$SUMMARY"
+    echo
+    echo "This command uses the following configuration properties:"
+    echo
+    echo "  clock: <integer>   Max clock value allowed for this policy to work (default: none)"
+    echo
+    echo "  time: <integer>   Max time (since last reboot) value allowed for this policy to work (default: none)"
+    echo
+    echo "  resets: <integer>   Max reset count (reboot)  allowed for this policy to work (default: none)"
+    echo
+    echo "  restarts: <integer>   Max restart count allowed for this policy to work (default: none)"
+    echo
+    echo "  safe: <boolean>   Expected value of the safe flag (default: true)"
+    echo
+    echo "For each parameter, positive value is absolue, negative value is X more than current value"
+    exit 2
+fi
+
+TPM2TOOLS_INFO="$(tpm2_createprimary -v)"
+
+match='version="(.)\.'
+[[ $TPM2TOOLS_INFO =~ $match ]] && TPM2TOOLS_VERSION="${BASH_REMATCH[1]}"
+if [[ $TPM2TOOLS_VERSION -lt 3 ]] || [[ $TPM2TOOLS_VERSION -gt 5 ]]; then
+    echo "The tpm2 pin requires a tpm2-tools version between 3 and 5" >&2
+    exit 1
+fi
+
+# Old environment variables for tpm2-tools 3.0
+export TPM2TOOLS_TCTI_NAME=device
+export TPM2TOOLS_DEVICE_FILE=
+for dev in /dev/tpmrm?; do
+    [ -e "$dev" ] || continue
+    TPM2TOOLS_DEVICE_FILE="$dev"
+    break
+done
+
+# New environment variable for tpm2-tools >= 3.1
+export TPM2TOOLS_TCTI="$TPM2TOOLS_TCTI_NAME:$TPM2TOOLS_DEVICE_FILE"
+
+if [ -z "$TPM2TOOLS_DEVICE_FILE" ]; then
+    echo "A TPM2 device with the in-kernel resource manager is needed!" >&2
+    exit 1
+fi
+
+if ! [[ -r "$TPM2TOOLS_DEVICE_FILE" && -w "$TPM2TOOLS_DEVICE_FILE" ]]; then
+    echo "The $TPM2TOOLS_DEVICE_FILE device must be readable and writable!" >&2
+    exit 1
+fi
+
+if ! cfg="$(jose fmt -j "$1" -Oo- 2>/dev/null)"; then
+    echo "Configuration is malformed!" >&2
+    exit 1
+fi
+
+time="$(jose fmt -j- -Og time -Io- <<< "$cfg")" || true
+clock="$(jose fmt -j- -Og clock -Io- <<< "$cfg")" || true
+reset="$(jose fmt -j- -Og resets -Io- <<< "$cfg")" || true
+restart="$(jose fmt -j- -Og restarts -Io- <<< "$cfg")" || true
+
+safe="$(jose fmt -j- -Og safe -Bo- <<< "$cfg")" || safe="true"
+
+
+[ -z "$time" ]    || [ "$time" -ge 0 ]    || time=$((    $(tpm2_readclock | grep time    | grep -o [0-9]'*') - time))
+[ -z "$clock" ]   || [ "$clock" -ge 0 ]   || clock=$((   $(tpm2_readclock | grep clock   | grep -o [0-9]'*') - clock))
+[ -z "$reset" ]   || [ "$reset" -ge 0 ]   || reset=$((   $(tpm2_readclock | grep reset   | grep -o [0-9]'*') - reset))
+[ -z "$restart" ] || [ "$restart" -ge 0 ] || restart=$(( $(tpm2_readclock | grep restart | grep -o [0-9]'*') - restart))
+
+if ! jwk="$(jose jwk gen -i '{"alg":"A256GCM"}')"; then
+    echo "Generating a jwk failed!" >&2
+    exit 1
+fi
+
+if ! TMP="$(mktemp -d)"; then
+    echo "Creating a temporary dir for TPM files failed!" >&2
+    exit 1
+fi
+
+trap 'on_exit' EXIT
+
+tpm2_createprimary -C o -g sha256 -G ecc -c "$TMP"/primary.context -Q || fail=$?
+if [ -n "$fail" ]; then
+    echo "Creating TPM2 primary key failed!" >&2
+    exit 1
+fi
+
+tpm2_startauthsession -S "$TMP"/session.ctx || fail=$?
+if [ -n "$fail" ]; then
+    echo "Creating TPM2 session failed!" >&2
+    exit 1
+fi
+
+if [ -n "$time" ]; then
+    tpm2_policycountertimer -Q -S "$TMP"/session.ctx -L "$TMP"/policy.countertimer --ule time=$time || fail=$?
+    if [ -n "$fail" ]; then
+        echo "Adding time policy failed!" >&2
+        exit 1
+    fi
+fi
+if [ -n "$clock" ]; then
+    tpm2_policycountertimer -Q -S "$TMP"/session.ctx -L "$TMP"/policy.countertimer --ule clock=$clock || fail=$?
+    if [ -n "$fail" ]; then
+        echo "Adding clock policy failed!" >&2
+        exit 1
+    fi
+fi
+if [ -n "$reset" ]; then
+    tpm2_policycountertimer -Q -S "$TMP"/session.ctx -L "$TMP"/policy.countertimer --ule resets=$reset || fail=$?
+    if [ -n "$fail" ]; then
+        echo "Adding resets policy failed!" >&2
+        exit 1
+    fi
+fi
+if [ -n "$restart" ]; then
+    tpm2_policycountertimer -Q -S "$TMP"/session.ctx -L "$TMP"/policy.countertimer --ule restarts=$restart || fail=$?
+    if [ -n "$fail" ]; then
+        echo "Adding restarts policy failed!" >&2
+        exit 1
+    fi
+fi
+
+if [ -n "$safe" ] && [ "$safe" == "true" ]; then
+    tpm2_policycountertimer -Q -S "$TMP"/session.ctx -L "$TMP"/policy.countertimer safe || fail=$?
+    if [ -n "$fail" ]; then
+        echo "Adding safe policy failed!" >&2
+        exit 1
+    fi
+fi
+
+tpm2_flushcontext "$TMP"/session.ctx || fail=$?
+if [ -n "$fail" ]; then
+    echo "Flushing TPM2 session failed!" >&2
+    exit 1
+fi
+
+
+tpm2_create -Q -g sha256 -C "$TMP"/primary.context -u "$TMP"/jwk.pub -r "$TMP"/jwk.priv -a "$obj_attr" -L "$TMP"/policy.countertimer -i- <<< "$jwk" || fail=$?
+
+if [ -n "$fail" ]; then
+    echo "Creating TPM2 object for jwk failed!" >&2
+    exit 1
+fi
+
+if ! jwk_pub="$(jose b64 enc -I "$TMP"/jwk.pub)"; then
+    echo "Encoding jwk.pub in Base64 failed!" >&2
+    exit 1
+fi
+
+if ! jwk_priv="$(jose b64 enc -I "$TMP"/jwk.priv)"; then
+    echo "Encoding jwk.priv in Base64 failed!" >&2
+    exit 1
+fi
+
+jwe='{"protected":{"clevis":{"pin":"tpm2clock","tpm2clock":{}}}}'
+[ -n "$time"    ] && jwe="$(jose fmt -j "$jwe" -g protected -g clevis -g tpm2clock -j "$time"    -I -s time -UUUUo-)"
+[ -n "$clock"   ] && jwe="$(jose fmt -j "$jwe" -g protected -g clevis -g tpm2clock -j "$clock"   -I -s clock -UUUUo-)"
+[ -n "$reset"   ] && jwe="$(jose fmt -j "$jwe" -g protected -g clevis -g tpm2clock -j "$reset"   -I -s reset -UUUUo-)"
+[ -n "$restart" ] && jwe="$(jose fmt -j "$jwe" -g protected -g clevis -g tpm2clock -j "$restart" -I -s restart -UUUUo-)"
+[ -n "$safe"    ] && jwe="$(jose fmt -j "$jwe" -g protected -g clevis -g tpm2clock -j "$safe"    -B -s safe -UUUUo-)"
+
+jwe="$(jose fmt -j "$jwe" -g protected -g clevis -g tpm2clock -q "$jwk_pub" -s jwk_pub -UUUUo-)"
+jwe="$(jose fmt -j "$jwe" -g protected -g clevis -g tpm2clock -q "$jwk_priv" -s jwk_priv -UUUUo-)"
+
+# The on_exit() trap will not be fired after exec, so let's clean up the temp
+# directory at this point.
+[ -d "${TMP}" ] && rm -rf "${TMP}"
+
+exec jose jwe enc -i- -k- -I- -c < <(echo -n "$jwe$jwk"; /bin/cat)
