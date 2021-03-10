@@ -40,7 +40,7 @@ function on_exit() {
 if [ -t 0 ]; then
     exec >&2
     echo
-    echo "Usage: clevis decrypt tpm2 < JWE > PLAINTEXT"
+    echo "Usage: clevis decrypt tpm2clock < JWE > PLAINTEXT"
     echo
     exit 2
 fi
@@ -83,27 +83,23 @@ if ! jhd="$(jose b64 dec -i- <<< "$hdr")"; then
     exit 1
 fi
 
-if [ "$(jose fmt -j- -Og clevis -g pin -u- <<< "$jhd")" != "tpm2" ]; then
+if [ "$(jose fmt -j- -Og clevis -g pin -u- <<< "$jhd")" != "tpm2clock" ]; then
     echo "JWE pin mismatch!" >&2
     exit 1
 fi
 
-if ! hash="$(jose fmt -j- -Og clevis -g tpm2 -g hash -Su- <<< "$jhd")"; then
-    echo "JWE missing required 'hash' header parameter!" >&2
-    exit 1
-fi
+time="$(   jose fmt -j- -Og clevis -g tpm2clock -g time    -Io- <<< "$jhd")" || true
+clock="$(  jose fmt -j- -Og clevis -g tpm2clock -g clock   -Io- <<< "$jhd")" || true
+reset="$(  jose fmt -j- -Og clevis -g tpm2clock -g reset   -Io- <<< "$jhd")" || true
+restart="$(jose fmt -j- -Og clevis -g tpm2clock -g restart -Io- <<< "$jhd")" || true
+safe="$(   jose fmt -j- -Og clevis -g tpm2clock -g safe    -Bo- <<< "$jhd")" || true
 
-if ! key="$(jose fmt -j- -Og clevis -g tpm2 -g key -Su- <<< "$jhd")"; then
+if ! jwk_pub="$(jose fmt -j- -Og clevis -g tpm2clock -g jwk_pub -Su- <<< "$jhd")"; then
     echo "JWE missing required 'key' header parameter!" >&2
     exit 1
 fi
 
-if ! jwk_pub="$(jose fmt -j- -Og clevis -g tpm2 -g jwk_pub -Su- <<< "$jhd")"; then
-    echo "JWE missing required 'key' header parameter!" >&2
-    exit 1
-fi
-
-if ! jwk_priv="$(jose fmt -j- -Og clevis -g tpm2 -g jwk_priv -Su- <<< "$jhd")"; then
+if ! jwk_priv="$(jose fmt -j- -Og clevis -g tpm2clock -g jwk_priv -Su- <<< "$jhd")"; then
     echo "JWE missing required 'key' header parameter!" >&2
     exit 1
 fi
@@ -115,14 +111,6 @@ fi
 
 trap 'on_exit' EXIT
 
-pcr_ids="$(jose fmt -j- -Og clevis -g tpm2 -g pcr_ids -Su- <<< "$jhd")" || true
-
-pcr_spec=''
-if [ -n "$pcr_ids" ]; then
-    pcr_bank="$(jose fmt -j- -Og clevis -g tpm2 -g pcr_bank -Su- <<< "$jhd")"
-    pcr_spec="$pcr_bank:$pcr_ids"
-fi
-
 if ! jose b64 dec -i- -O "$TMP"/jwk.pub <<< "$jwk_pub"; then
     echo "Decoding jwk.pub from Base64 failed!" >&2
     exit 1
@@ -133,35 +121,70 @@ if ! jose b64 dec -i- -O "$TMP"/jwk.priv <<< "$jwk_priv"; then
     exit 1
 fi
 
-case "$TPM2TOOLS_VERSION" in
-    3) tpm2_createprimary -Q -H "$auth" -g "$hash" -G "$key" -C "$TMP"/primary.context || fail=$?;;
-    4|5) tpm2_createprimary -Q -C "$auth" -g "$hash" -G "$key" -c "$TMP"/primary.context || fail=$?;;
-    *) fail=1;;
-esac
+tpm2_createprimary -Q -C o -g sha256 -G ecc -c "$TMP"/primary.context || fail=$?
 if [ -n "$fail" ]; then
     echo "Creating TPM2 primary key failed!" >&2
     exit 1
 fi
 
-case "$TPM2TOOLS_VERSION" in
-    3) tpm2_load -Q -c "$TMP"/primary.context -u "$TMP"/jwk.pub -r "$TMP"/jwk.priv \
-                 -C "$TMP"/load.context || fail=$?;;
-    4|5) tpm2_load -Q -C "$TMP"/primary.context -u "$TMP"/jwk.pub -r "$TMP"/jwk.priv \
-                   -c "$TMP"/load.context || fail=$?;;
-    *) fail=1;;
-esac
+tpm2_load -Q -C "$TMP"/primary.context -u "$TMP"/jwk.pub -r "$TMP"/jwk.priv -c "$TMP"/load.context || fail=$?
 if [ -n "$fail" ]; then
     echo "Loading jwk to TPM2 failed!" >&2
     exit 1
 fi
 
-case "$TPM2TOOLS_VERSION" in
-    3) jwk="$(tpm2_unseal -c "$TMP"/load.context ${pcr_spec:+-L $pcr_spec})" || fail=$?;;
-    4|5) jwk="$(tpm2_unseal -c "$TMP"/load.context ${pcr_spec:+-p pcr:$pcr_spec})" || fail=$?;;
-    *) fail=1;;
-esac
+tpm2_startauthsession -S "$TMP"/session.ctx --policy-session || fail=$?
+if [ -n "$fail" ]; then
+    echo "Creating TPM2 session failed!" >&2
+    exit 1
+fi
+
+if [ -n "$time" ]; then
+    tpm2_policycountertimer -Q -S "$TMP"/session.ctx -L "$TMP"/policy.countertimer --ule time=$time || fail=$?
+    if [ -n "$fail" ]; then
+        echo "Adding time policy failed!" >&2
+        exit 1
+    fi
+fi
+if [ -n "$clock" ]; then
+    tpm2_policycountertimer -Q -S "$TMP"/session.ctx -L "$TMP"/policy.countertimer --ule clock=$clock || fail=$?
+    if [ -n "$fail" ]; then
+        echo "Adding clock policy failed!" >&2
+        exit 1
+    fi
+fi
+if [ -n "$reset" ]; then
+    tpm2_policycountertimer -Q -S "$TMP"/session.ctx -L "$TMP"/policy.countertimer --ule resets=$reset || fail=$?
+    if [ -n "$fail" ]; then
+        echo "Adding resets policy failed!" >&2
+        exit 1
+    fi
+fi
+if [ -n "$restart" ]; then
+    tpm2_policycountertimer -Q -S "$TMP"/session.ctx -L "$TMP"/policy.countertimer --ule restarts=$restart || fail=$?
+    if [ -n "$fail" ]; then
+        echo "Adding restarts policy failed!" >&2
+        exit 1
+    fi
+fi
+
+if [ -n "$safe" ] && [ "$safe" == "true" ]; then
+    tpm2_policycountertimer -Q -S "$TMP"/session.ctx -L "$TMP"/policy.countertimer safe || fail=$?
+    if [ -n "$fail" ]; then
+        echo "Adding safe policy failed!" >&2
+        exit 1
+    fi
+fi
+
+jwk="$(tpm2_unseal -c "$TMP"/load.context -p session:"$TMP"/session.ctx)" || fail=$?
 if [ -n "$fail" ]; then
     echo "Unsealing jwk from TPM failed!" >&2
+    exit 1
+fi
+
+tpm2_flushcontext "$TMP"/session.ctx || fail=$?
+if [ -n "$fail" ]; then
+    echo "Flushing TPM2 session failed!" >&2
     exit 1
 fi
 
