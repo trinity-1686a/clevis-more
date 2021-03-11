@@ -31,7 +31,7 @@ fi
 
 pins=$(($(jose fmt -j- -Alo- <<< "$cfg") - 1))
 pin_list=()
-for i in $(seq $pin_count -1 0); do
+for i in $(seq $pins -1 0); do
     pin=$(jose fmt -j- -Ag $i -o- <<<"$cfg")
     pin_name=$(jose fmt -j- -Og pin -u- <<<"$pin")
     pin_cfg=$(jose fmt -j- -Og config -o- <<<"$pin")
@@ -56,4 +56,4 @@ run_pipeline() {
 res=$( (echo -n '$'; cat) | run_pipeline "${pin_list[@]}")
 
 jose fmt -j '{"clevis": {"pin": "chain"}}' -g clevis -q "$res" -s chain -UUYu- | tr -d '\n'
-echo .
+echo ....
