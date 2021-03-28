@@ -18,12 +18,6 @@
 # along with this program.  If not, see <http://www.gnu.org/licenses/>.
 #
 
-# First try to use the new version of the PIN implementation
-if command -v clevis-pin-tpm2 >/dev/null;
-then
-    exec clevis-pin-tpm2 encrypt "$@"
-fi
-
 SUMMARY="Encrypts using a TPM2.0 chip binding policy based on counters and timers"
 # Algorithm type must be keyedhash for object with user provided sensitive data.
 alg_create_key="keyedhash"
@@ -47,7 +41,7 @@ fi
 if [ -t 0 ]; then
     exec >&2
     echo
-    echo "Usage: clevis encrypt tpm2 CONFIG < PLAINTEXT > JWE"
+    echo "Usage: clevis encrypt tpm2counter CONFIG < PLAINTEXT > JWE"
     echo
     echo "$SUMMARY"
     echo
@@ -63,7 +57,9 @@ if [ -t 0 ]; then
     echo
     echo "  safe: <boolean>   Expected value of the safe flag (default: true)"
     echo
-    echo "For each parameter, positive value is absolue, negative value is X more than current value"
+    echo "  nvcounter: <array of {index: string, value: int}> non volatile counter to check. Index is a hex encoded 0x prefixed integer (default: [])"
+    echo
+    echo "For each parameter, positive value is absolute, negative value is X more than current value"
     exit 2
 fi
 
@@ -110,11 +106,42 @@ restart="$(jose fmt -j- -Og restarts -Io- <<< "$cfg")" || true
 
 safe="$(jose fmt -j- -Og safe -Bo- <<< "$cfg")" || safe="true"
 
+nvcounter_len="$(jose fmt -j- -Og nvcounter -Alo- <<< "$cfg")" || true
+nvindexlist=()
+nvvaluelist=()
+if [ -n "$nvcounter_len" -a "$nvcounter_len" != 0 ]; then
+    nvcounter_json="$(jose fmt -j- -Og nvcounter -Ao- <<< "$cfg")"
+    for index in $(seq 0 $((nvcounter_len - 1))); do
+        nvindex=$(jose fmt -j- -g $index -g index -Su- <<< "$nvcounter_json" | grep -E '^0x[0-9a-fA-F]+$') || fail=$?
+        if [ -n "$fail" ]; then
+            echo "Reading nv configuration failed!" >&2
+            exit 1
+        fi
+        nvindexlist+=( $nvindex )
+        nvvalue=$(jose fmt -j- -g $index -g value -Io- <<< "$nvcounter_json") || fail=$?
+        if [ -n "$fail" ]; then
+            echo "Reading nv configuration failed!" >&2
+        fi
 
-[ -z "$time" ]    || [ "$time" -ge 0 ]    || time=$((    $(tpm2_readclock | grep time    | grep -o [0-9]'*') - time))
-[ -z "$clock" ]   || [ "$clock" -ge 0 ]   || clock=$((   $(tpm2_readclock | grep clock   | grep -o [0-9]'*') - clock))
-[ -z "$reset" ]   || [ "$reset" -ge 0 ]   || reset=$((   $(tpm2_readclock | grep reset   | grep -o [0-9]'*') - reset))
-[ -z "$restart" ] || [ "$restart" -ge 0 ] || restart=$(( $(tpm2_readclock | grep restart | grep -o [0-9]'*') - restart))
+        # create index if doesn't exists
+        tpm2_nvread $nvindex > /dev/null 2>&1 || 
+            ( 
+                tpm2_nvdefine -C o -s 8 -a "ownerread|authread|authwrite|ownerwrite|nt=1" $nvindex > /dev/null &&
+                tpm2_nvincrement $nvindex &&
+                echo Initialized new nvindex $nvindex
+            )
+
+        [ "$nvvalue" -gt 0 ] || nvvalue=$(( $(tpm2_nvread $nvindex | od --endian=big -A none -t d8 | tr -d ' ') - nvvalue))
+        nvvaluelist+=( $(printf '%016x\n' "$nvvalue") )
+    done
+fi
+
+
+
+[ -z "$time" ]    || [ "$time" -gt 0 ]    || time=$((    $(tpm2_readclock | grep time    | grep -o [0-9]'*') - time))
+[ -z "$clock" ]   || [ "$clock" -gt 0 ]   || clock=$((   $(tpm2_readclock | grep clock   | grep -o [0-9]'*') - clock))
+[ -z "$reset" ]   || [ "$reset" -gt 0 ]   || reset=$((   $(tpm2_readclock | grep reset   | grep -o [0-9]'*') - reset))
+[ -z "$restart" ] || [ "$restart" -gt 0 ] || restart=$(( $(tpm2_readclock | grep restart | grep -o [0-9]'*') - restart))
 
 if ! jwk="$(jose jwk gen -i '{"alg":"A256GCM"}')"; then
     echo "Generating a jwk failed!" >&2
@@ -177,6 +204,14 @@ if [ -n "$safe" ] && [ "$safe" == "true" ]; then
     fi
 fi
 
+for i in ${!nvindexlist[@]}; do
+    echo ${nvvaluelist[$i]} | xxd -r -p | tpm2_policynv -Q -S "$TMP"/session.ctx -L "$TMP"/policy.countertimer -i- ${nvindexlist[$i]} ule || fail=$?
+    if [ -n "$fail" ]; then
+        echo "Adding nv index policy failed!" >&2
+        exit 1
+    fi
+done
+
 tpm2_flushcontext "$TMP"/session.ctx || fail=$?
 if [ -n "$fail" ]; then
     echo "Flushing TPM2 session failed!" >&2
@@ -201,15 +236,21 @@ if ! jwk_priv="$(jose b64 enc -I "$TMP"/jwk.priv)"; then
     exit 1
 fi
 
-jwe='{"protected":{"clevis":{"pin":"tpm2clock","tpm2clock":{}}}}'
-[ -n "$time"    ] && jwe="$(jose fmt -j "$jwe" -g protected -g clevis -g tpm2clock -j "$time"    -I -s time -UUUUo-)"
-[ -n "$clock"   ] && jwe="$(jose fmt -j "$jwe" -g protected -g clevis -g tpm2clock -j "$clock"   -I -s clock -UUUUo-)"
-[ -n "$reset"   ] && jwe="$(jose fmt -j "$jwe" -g protected -g clevis -g tpm2clock -j "$reset"   -I -s reset -UUUUo-)"
-[ -n "$restart" ] && jwe="$(jose fmt -j "$jwe" -g protected -g clevis -g tpm2clock -j "$restart" -I -s restart -UUUUo-)"
-[ -n "$safe"    ] && jwe="$(jose fmt -j "$jwe" -g protected -g clevis -g tpm2clock -j "$safe"    -B -s safe -UUUUo-)"
+jwe='{"protected":{"clevis":{"pin":"tpm2counter","tpm2counter":{}}}}'
+[ -n "$time"    ] && jwe="$(jose fmt -j "$jwe" -g protected -g clevis -g tpm2counter -j "$time"    -I -s time -UUUUo-)"
+[ -n "$clock"   ] && jwe="$(jose fmt -j "$jwe" -g protected -g clevis -g tpm2counter -j "$clock"   -I -s clock -UUUUo-)"
+[ -n "$reset"   ] && jwe="$(jose fmt -j "$jwe" -g protected -g clevis -g tpm2counter -j "$reset"   -I -s reset -UUUUo-)"
+[ -n "$restart" ] && jwe="$(jose fmt -j "$jwe" -g protected -g clevis -g tpm2counter -j "$restart" -I -s restart -UUUUo-)"
+[ -n "$safe"    ] && jwe="$(jose fmt -j "$jwe" -g protected -g clevis -g tpm2counter -j "$safe"    -B -s safe -UUUUo-)"
+if [ "${#nvindexlist[@]}" -ne 0 ]; then
+    jwe="$(jose fmt -j "$jwe" -g protected -g clevis -g tpm2counter -j "[]" -s nvcounter -UUUUo-)"
+    for i in ${!nvindexlist[@]}; do
+        jwe="$(jose fmt -j "$jwe" -g protected -g clevis -g tpm2counter -g nvcounter -j "{}" -q ${nvindexlist[$i]} -s index -Uq ${nvvaluelist[$i]} -s value -UaUUUUUo-)"
+    done
+fi
 
-jwe="$(jose fmt -j "$jwe" -g protected -g clevis -g tpm2clock -q "$jwk_pub" -s jwk_pub -UUUUo-)"
-jwe="$(jose fmt -j "$jwe" -g protected -g clevis -g tpm2clock -q "$jwk_priv" -s jwk_priv -UUUUo-)"
+jwe="$(jose fmt -j "$jwe" -g protected -g clevis -g tpm2counter -q "$jwk_pub" -s jwk_pub -UUUUo-)"
+jwe="$(jose fmt -j "$jwe" -g protected -g clevis -g tpm2counter -q "$jwk_priv" -s jwk_priv -UUUUo-)"
 
 # The on_exit() trap will not be fired after exec, so let's clean up the temp
 # directory at this point.

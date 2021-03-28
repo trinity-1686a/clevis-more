@@ -18,12 +18,6 @@
 # along with this program.  If not, see <http://www.gnu.org/licenses/>.
 #
 
-# First try to use the new version of the PIN implementation
-if command -v clevis-pin-tpm2 >/dev/null;
-then
-    exec clevis-pin-tpm2 decrypt $@
-fi
-
 # The owner hierarchy is the one that should be used by the Operating System.
 auth="o"
 
@@ -40,7 +34,7 @@ function on_exit() {
 if [ -t 0 ]; then
     exec >&2
     echo
-    echo "Usage: clevis decrypt tpm2clock < JWE > PLAINTEXT"
+    echo "Usage: clevis decrypt tpm2counter < JWE > PLAINTEXT"
     echo
     exit 2
 fi
@@ -83,23 +77,34 @@ if ! jhd="$(jose b64 dec -i- <<< "$hdr")"; then
     exit 1
 fi
 
-if [ "$(jose fmt -j- -Og clevis -g pin -u- <<< "$jhd")" != "tpm2clock" ]; then
+if [ "$(jose fmt -j- -Og clevis -g pin -u- <<< "$jhd")" != "tpm2counter" ]; then
     echo "JWE pin mismatch!" >&2
     exit 1
 fi
 
-time="$(   jose fmt -j- -Og clevis -g tpm2clock -g time    -Io- <<< "$jhd")" || true
-clock="$(  jose fmt -j- -Og clevis -g tpm2clock -g clock   -Io- <<< "$jhd")" || true
-reset="$(  jose fmt -j- -Og clevis -g tpm2clock -g reset   -Io- <<< "$jhd")" || true
-restart="$(jose fmt -j- -Og clevis -g tpm2clock -g restart -Io- <<< "$jhd")" || true
-safe="$(   jose fmt -j- -Og clevis -g tpm2clock -g safe    -Bo- <<< "$jhd")" || true
+time="$(   jose fmt -j- -Og clevis -g tpm2counter -g time    -Io- <<< "$jhd")" || true
+clock="$(  jose fmt -j- -Og clevis -g tpm2counter -g clock   -Io- <<< "$jhd")" || true
+reset="$(  jose fmt -j- -Og clevis -g tpm2counter -g reset   -Io- <<< "$jhd")" || true
+restart="$(jose fmt -j- -Og clevis -g tpm2counter -g restart -Io- <<< "$jhd")" || true
+safe="$(   jose fmt -j- -Og clevis -g tpm2counter -g safe    -Bo- <<< "$jhd")" || true
+nvcounter_len="$(jose fmt -j- -Og clevis -g tpm2counter -g nvcounter -Alo- <<< "$jhd")" || true
+nvindexlist=()
+nvvaluelist=()
+if [ -n "$nvcounter_len" -a "$nvcounter_len" != 0 ]; then
+    nvcounter_json="$(jose fmt -j- -Og clevis -g tpm2counter -g nvcounter -Ao- <<< "$jhd")"
+    for index in $(seq 0 $((nvcounter_len - 1))); do
+        nvindexlist+=$(jose fmt -j- -g $index -g index -Su- <<< "$nvcounter_json")
+        nvvaluelist+=$(jose fmt -j- -g $index -g value -Su- <<< "$nvcounter_json")
+    done
+fi
 
-if ! jwk_pub="$(jose fmt -j- -Og clevis -g tpm2clock -g jwk_pub -Su- <<< "$jhd")"; then
+
+if ! jwk_pub="$(jose fmt -j- -Og clevis -g tpm2counter -g jwk_pub -Su- <<< "$jhd")"; then
     echo "JWE missing required 'key' header parameter!" >&2
     exit 1
 fi
 
-if ! jwk_priv="$(jose fmt -j- -Og clevis -g tpm2clock -g jwk_priv -Su- <<< "$jhd")"; then
+if ! jwk_priv="$(jose fmt -j- -Og clevis -g tpm2counter -g jwk_priv -Su- <<< "$jhd")"; then
     echo "JWE missing required 'key' header parameter!" >&2
     exit 1
 fi
@@ -175,6 +180,14 @@ if [ -n "$safe" ] && [ "$safe" == "true" ]; then
         exit 1
     fi
 fi
+
+for i in ${!nvindexlist[@]}; do
+    echo ${nvvaluelist[$i]} | xxd -r -p | tpm2_policynv -Q -S "$TMP"/session.ctx -L "$TMP"/policy.countertimer -i- ${nvindexlist[$i]} ule || fail=$?
+    if [ -n "$fail" ]; then
+        echo "Adding nv index policy failed!" >&2
+        exit 1
+    fi
+done
 
 jwk="$(tpm2_unseal -c "$TMP"/load.context -p session:"$TMP"/session.ctx)" || fail=$?
 if [ -n "$fail" ]; then
